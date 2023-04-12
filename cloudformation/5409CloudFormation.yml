@@ -1,0 +1,307 @@
+Parameters:
+  BucketName:
+    Type: String
+    Default: autohubS3
+  CarTableName:
+    Type: String
+    Default: AutoHubCars
+  UserTableName:
+    Type: String
+    Default: AutoHubUsers
+  SecretKeyName:
+    Type: String
+    Default: AutoHubSecrets
+  LambdaFuncName:
+    Type: String
+    Default: AutoHubLambda
+  SnsTopicName:
+    Type: String
+    Default: AutoHubSns
+  AwsAccessKey:
+    Type: String
+    Description: "Enter your AWS access key"
+  AwsSecretAccessKey:
+    Type: String
+    Description: "Enter your AWS secret access key"
+  AwsSessionToken:
+    Type: String
+    Description: "Enter your AWS session token"
+  KeyName:
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+    Description: cloud key
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cloudkey
+  SSHLocation:
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+    Default: 0.0.0.0/0
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+
+#AWS secret manager
+Resources:
+  MySecret:
+    Type: "AWS::SecretsManager::Secret"
+    DependsOn:
+      - S3CloudFront
+      - MySNSTopic
+    Properties:
+      Name: !Ref SecretKeyName
+      Description: "5409 cloud project secret"
+      SecretString: !Sub |
+        {"bucket_name":"${BucketName}","car_table_name":"${CarTableName}","user_table_name":"${UserTableName}", "cloudfront_url":"${S3CloudFront.DomainName}","sns_arn":"${MySNSTopic.TopicArn}"}
+
+  #Cloudfront
+  S3CloudFront:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - S3Bucket
+      - S3BucketPolicy
+    Properties:
+      DistributionConfig:
+        Comment: This is my CloudFront 12198
+        Origins:
+          - DomainName: !GetAtt S3Bucket.DomainName
+            Id: myS3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        Enabled: "true"
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          ViewerProtocolPolicy: redirect-to-https
+          ForwardedValues:
+            QueryString: "false"
+            Cookies:
+              Forward: none
+          TargetOriginId: myS3Origin
+        PriceClass: PriceClass_All
+
+    #S3 bucket
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: autohubS3
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "s3:GetObject"
+            Effect: Allow
+            Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref S3Bucket
+                - /*
+            Principal: "*"
+
+  #sns creation
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Car Entry Notification"
+      TopicName: !Ref SnsTopicName
+
+  #lambda function
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MySNSTopic
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          const topicArn = "arn:aws:sns:us-east-1:458991758553:AutoHubSns";
+
+          exports.handler = async (event) => {
+            for (const record of event.Records) {
+              if (record.eventName === 'MODIFY' || record.eventName === 'INSERT' ) {
+                const message = `New car has been listed on the portal`;
+                const params = {
+                TopicArn: topicArn,
+                Message: message,
+                };
+              await sns.publish(params).promise();
+              }
+            }
+          }
+      FunctionName: !Ref LambdaFuncName #change
+      Handler: index.handler
+      Runtime: nodejs16.x
+      Role: "arn:aws:iam::458991758553:role/LabRole"
+
+  #cardynamo
+  CarDetailsDynamoTable:
+    Type: AWS::DynamoDB::Table
+    DependsOn: MySecret
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "id"
+          AttributeType: "S"
+        - AttributeName: "owner_name"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "id"
+          KeyType: "HASH"
+        - AttributeName: "owner_name"
+          KeyType: "RANGE"
+      BillingMode: "PROVISIONED"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      StreamSpecification:
+        StreamViewType: "NEW_IMAGE"
+      TableName: !Ref CarTableName
+
+  MyDynamoTableStream:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: CarDetailsDynamoTable
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt CarDetailsDynamoTable.StreamArn
+      FunctionName: !Ref MyLambdaFunction
+      StartingPosition: "LATEST"
+
+  UserDetailsDynamoTable:
+    Type: AWS::DynamoDB::Table
+    DependsOn: MySecret
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "username"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "username"
+          KeyType: "HASH"
+      BillingMode: "PROVISIONED"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      StreamSpecification:
+        StreamViewType: "NEW_IMAGE"
+      TableName: !Ref UserTableName
+
+  #EBS
+  EBSApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      Description: EBS Backend for Auto Hub
+  EBSApplicationVersion:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref EBSApplication
+      Description: EBS Backend for Auto Hub Version 1.0
+      SourceBundle:
+        S3Bucket: "codebucket5409"
+        S3Key: "5409backend.zip"
+  EBSConfigurationTemplate:
+    Type: AWS::ElasticBeanstalk::ConfigurationTemplate
+    Properties:
+      ApplicationName: !Ref EBSApplication
+      Description: EBS Backend for Auto Hub Configuration Template
+      OptionSettings:
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: "aws_access_key_id"
+          Value: !Ref AwsAccessKey
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: "aws_secret_access_key"
+          Value: !Ref AwsSecretAccessKey
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: "aws_session_token"
+          Value: !Ref AwsSessionToken
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: "secret_key_name"
+          Value: !Ref SecretKeyName
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: EC2KeyName
+          Value: !Ref KeyName
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref MyInstanceProfile
+      SolutionStackName: 64bit Amazon Linux 2 v5.8.0 running Node.js 16
+
+  EBSEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    DependsOn:
+      - MySecret
+      - S3CloudFront
+      - S3Bucket
+      - S3BucketPolicy
+      - MySNSTopic
+      - MyLambdaFunction
+      - CarDetailsDynamoTable
+      - UserDetailsDynamoTable
+
+    Properties:
+      ApplicationName: !Ref EBSApplication
+      Description: EBS Backend for Auto Hub Environment
+      TemplateName: !Ref EBSConfigurationTemplate
+      VersionLabel: !Ref EBSApplicationVersion
+  MyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles: ["LabRole"]
+
+  #ec2 resource frontend
+  FrontendInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic to port 5000
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - CidrIp: !Ref SSHLocation
+          FromPort: "22"
+          IpProtocol: tcp
+          ToPort: "22"
+        - IpProtocol: tcp
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: 0.0.0.0/0
+    DependsOn: EBSEnvironment
+
+  FrontendEC2Instance:
+    Type: "AWS::EC2::Instance"
+    DependsOn: EBSEnvironment
+    Properties:
+      InstanceType: t2.large
+      ImageId: ami-00c39f71452c08778
+      KeyName: cloudkey
+      SecurityGroupIds:
+        - !Ref FrontendInstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          curl -sL https://rpm.nodesource.com/setup_16.x | bash -
+          sudo yum install nodejs -y
+          sudo yum install unzip -y
+          sudo yum install python3 -y
+          curl -O https://bootstrap.pypa.io/get-pip.py
+          python3 get-pip.py --user
+          export PATH=$PATH:/root/.local/bin
+          pip3 install awscli --upgrade --user
+          aws configure set aws_access_key_id ${AwsAccessKey}
+          aws configure set aws_secret_access_key ${AwsSecretAccessKey}
+          aws configure set aws_session_token ${AwsSessionToken}
+          cd /home/ec2-user
+          echo -e "\nREACT_APP_BACKEND_IP=http://$(aws elasticbeanstalk describe-environments --environment-names ${EBSEnvironment} --query 'Environments[0].CNAME' --output text)" >> .env
+          aws s3 cp s3://codebucket5409/5409frontend.zip .
+          unzip 5409frontend.zip
+          npm install
+          npm start
+
+      Tags:
+        - Key: Name
+          Value: FrontendEC2
